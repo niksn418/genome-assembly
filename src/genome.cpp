@@ -1,6 +1,7 @@
 #include "genome.h"
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <unordered_map>
 #include <vector>
@@ -9,27 +10,112 @@ namespace genome {
 
 namespace {
 
-struct vertex
+struct genome_string_hasher
 {
-    using edge = std::pair<vertex * const, const std::string_view>;
+    static constexpr size_t p = 5;
 
-    size_t in_degree;
-    std::vector<edge> edges;
+    const size_t k;
+    std::array<size_t, 4> max_hash_values;
+    size_t last_hash;
+
+    genome_string_hasher(const size_t k)
+        : k(k)
+    {
+        const size_t max_power = pow(p, k);
+        max_hash_values[0] = 0;
+        max_hash_values[1] = max_power;
+        for (size_t i = 2; i < 4; ++i) {
+            max_hash_values[i] = max_hash_values[i - 1] + max_power;
+        }
+    }
+
+    static constexpr size_t encode_char(const char c)
+    {
+        return (c & 6) >> 1;
+    }
+
+    size_t hash(const std::string_view read, const size_t pos)
+    {
+        return last_hash = pos != 0
+                ? from_previous_hash(last_hash, read[pos - 1], read[k + pos - 1])
+                : hash(read.substr(0, k));
+    }
+
+    static constexpr size_t pow(size_t x, size_t power)
+    {
+        size_t result = 1;
+        while (power) {
+            if (power & 1) {
+                result *= x;
+            }
+            x *= x;
+            power >>= 1;
+        }
+        return result;
+    }
+
+    static constexpr size_t hash(const std::string_view & sv)
+    {
+        size_t hash = 0;
+        for (const char c : sv) {
+            hash = hash * p + encode_char(c);
+        }
+        return hash;
+    }
+
+    size_t from_previous_hash(const size_t previous_hash, const char last_symbol, const char new_symbol) const
+    {
+        return previous_hash * p - max_hash_values[encode_char(last_symbol)] + encode_char(new_symbol);
+    }
 };
 
-using string_graph = std::unordered_map<std::string_view, vertex>;
-
-void add_edge(vertex * const u, vertex * const v, const std::string_view edge_value)
+struct genome_string
 {
-    u->edges.emplace_back(v, edge_value);
-    ++(v->in_degree);
-}
+    const std::string_view m_value;
+    const size_t m_hash;
 
-vertex * add_vertex(const std::string_view key, string_graph & graph)
+    bool operator==(const genome_string & other) const
+    {
+        return m_value == other.m_value;
+    }
+
+    struct hash
+    {
+        size_t operator()(const genome_string & s) const
+        {
+            return s.m_hash;
+        }
+    };
+};
+
+struct genome_graph
 {
-    const auto res = graph.try_emplace(key);
-    return &res.first->second;
-}
+    struct vertex
+    {
+        std::vector<vertex *> neighbours;
+        const char value;
+        std::size_t in_degree = 0;
+
+        vertex(char value)
+            : value(value)
+        {
+        }
+    };
+
+    std::unordered_map<genome_string, vertex, genome_string::hash> vertices;
+
+    void add_edge(vertex * const u, vertex * const v)
+    {
+        u->neighbours.push_back(v);
+        ++v->in_degree;
+    }
+
+    vertex * add_vertex(genome_string && key)
+    {
+        auto res = vertices.emplace(key, key.m_value.back());
+        return &res.first->second;
+    }
+};
 
 } // anonymous namespace
 
@@ -39,32 +125,39 @@ std::string assembly(const size_t k, const std::vector<std::string> & reads)
         return "";
     }
     const size_t d = reads[0].size();
-    string_graph graph;
-    graph.reserve(reads.size() + 1);
+    genome_graph graph;
+    genome_string_hasher hasher(k);
+    using vertex = genome_graph::vertex;
+    graph.vertices.reserve(reads.size() * (d - k) + 1);
     for (const std::string_view read : reads) {
-        const auto u = add_vertex(read.substr(0, k), graph);
-        const auto v = add_vertex(read.substr(d - k, k), graph);
-        add_edge(u, v, read);
+        vertex * u = graph.add_vertex({read.substr(0, k), hasher.hash(read, 0)});
+        for (size_t i = 1; i <= d - k; ++i) {
+            vertex * const v = graph.add_vertex({read.substr(i, k), hasher.hash(read, i)});
+            graph.add_edge(u, v);
+            u = v;
+        }
     }
-    const auto start_it = std::find_if(graph.begin(), graph.end(), [](const auto & it) {
-        return it.second.edges.size() > it.second.in_degree;
-    });
+    std::deque<vertex *> s;
     std::string result;
     result.resize(k + reads.size() * (d - k));
-    std::copy(start_it->first.cbegin(), start_it->first.cend(), result.begin());
-    auto result_it = result.end();
-    std::deque<vertex::edge> stack;
-    stack.emplace_front(&start_it->second, start_it->first);
-    while (!stack.empty()) {
-        const auto & [v, edge_value] = stack.front();
-        std::vector<vertex::edge> & edges = v->edges;
-        if (edges.empty()) {
-            result_it = std::copy_backward(edge_value.cbegin() + k, edge_value.cend(), result_it);
-            stack.pop_front();
+    for (auto it = graph.vertices.begin(), end = graph.vertices.end(); it != end; ++it) {
+        auto & [key, v] = *it;
+        if (v.neighbours.size() > v.in_degree) {
+            s.push_front(&v);
+            std::copy(key.m_value.begin(), key.m_value.end(), result.begin());
+            break;
+        }
+    }
+    size_t index = result.size();
+    while (!s.empty()) {
+        vertex & u = *s.front();
+        if (u.neighbours.empty()) {
+            result[--index] = u.value;
+            s.pop_front();
         }
         else {
-            stack.push_front(edges.back());
-            edges.pop_back();
+            s.push_front(u.neighbours.back());
+            u.neighbours.pop_back();
         }
     }
     return result;
